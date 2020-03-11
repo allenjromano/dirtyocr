@@ -1,0 +1,601 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+prepare image
+```{r}
+library(magick)
+library(tiff)
+image_prepare <- function(x){
+    image_convert(x, type="Grayscale") # %>%
+   #  image_negate() %>%
+   # image_lat() %>%
+   # image_negate()
+}
+
+image_read("testimages/secolo2.png") %>%
+  image_prepare() %>%
+  image_write(path="testimages/processed/secolo2_bw.png", format="png")
+
+```
+
+
+Methods for denoising
+
+```{r}
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster)
+ 
+img = readPNG("testimages/processed/secolo2_bw.png")
+head(img)
+plot(raster(img))
+```
+
+
+model
+```{r}
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster, data.table)
+ 
+dirtyFolder = "~/Pictures/train"
+cleanFolder = "~/Pictures/train_cleaned"
+outFolder = "~/docs/archive/2020/dirtyocr/kaggledata"
+ 
+outPath = file.path(outFolder, "trainingdata.csv")
+filenames = list.files(dirtyFolder)
+for (f in filenames)
+{
+print(f)
+imgX = readPNG(file.path(dirtyFolder, f))
+imgY = readPNG(file.path(cleanFolder, f))
+ 
+# turn the images into vectors
+x = matrix(imgX, nrow(imgX) * ncol(imgX), 1)
+y = matrix(imgY, nrow(imgY) * ncol(imgY), 1)
+ 
+dat = data.table(cbind(y, x))
+setnames(dat,c("y", "x"))
+write.table(dat, file=outPath, append=(f != filenames[1]), sep=",", row.names=FALSE, col.names=(f == filenames[1]), quote=FALSE)
+}
+# view the data
+dat = read.csv(outPath)
+head(dat)
+rows = sample(nrow(dat), 10000)
+plot(dat$x[rows], dat$y[rows])
+```
+
+
+linear model
+```{r}
+# fit a linear model, ignoring the data points at the extremes
+lm.mod.1 = lm(y ~ x, data=dat[dat$y > 0.05 & dat$y < 0.95,])
+summary(lm.mod.1)
+dat$predicted = sapply(predict(lm.mod.1, newdata=dat), function(x) max(min(x, 1),0))
+plot(dat$predicted[rows], dat$y[rows])
+rmse1 = sqrt(mean( (dat$y - dat$x) ^ 2))
+rmse2 = sqrt(mean( (dat$predicted - dat$y) ^ 2))
+c(rmse1, rmse2)
+```
+
+
+apply to a new image
+```{r}
+# show the predicted result for a sample image
+img = readPNG("testimages/processed/secolo2_bw.png")
+x = data.table(matrix(img, nrow(img) * ncol(img), 1))
+setnames(x, "x")
+yHat = sapply(predict(lm.mod.1, newdata=x), function(x) max(min(x, 1),0))
+imgOut = matrix(yHat, nrow(img), ncol(img))
+writePNG(imgOut, "testimages/processed/secolo2_bw+lm.png")
+plot(raster(imgOut))
+```
+
+
+## Method number 2: clustering and thresholds
+
+img2vec
+```{r}
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster)
+ 
+img = readPNG("testimages/processed/secolo2_bw.png")
+ 
+# turn the image into a vector
+img2vec = function(img)
+{
+return (matrix(img, nrow(img) * ncol(img), 1))
+}
+ 
+# show a histogram
+hist(img2vec(img))
+```
+
+
+model three threshold values:
+```{r}
+# fit 3 clusters
+v = img2vec(img)
+km.mod = kmeans(v, 3)
+# allow for the random ordering of the clusters
+oc = order(km.mod$centers)
+# the lower threshold is the halfway point between the top of the lowest cluster and the bottom of the middle cluster
+loThresh = 0.5 * (max(v[km.mod$cluster == oc[1]]) + min(v[km.mod$cluster == oc[2]]))
+# the higher threshold is the halfway point between the top of the middle cluster and the bottom of the highest cluster
+hiThresh = 0.5 * (max(v[km.mod$cluster == oc[2]]) + min(v[km.mod$cluster == oc[3]]))
+ 
+# using lower threshold
+imgLo = img
+imgLo[imgLo <= loThresh] = 0 
+imgLo[imgLo > loThresh] = 1
+plot(raster(imgLo))
+ 
+# using upper threshold
+imgHi = img
+imgHi[imgHi <= hiThresh] = 0 
+imgHi[imgHi > hiThresh] = 1
+plot(raster(imgHi))
+```
+
+
+
+
+```{r}
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster, data.table, gbm)
+ 
+# a function to do k-means thresholding
+ 
+kmeansThreshold = function(img)
+{
+# fit 3 clusters
+v = img2vec(img)
+km.mod = kmeans(v, 3)
+# allow for the random ordering of the clusters
+oc = order(km.mod$centers)
+# the higher threshold is the halfway point between the top of the middle cluster and the bottom of the highest cluster
+hiThresh = 0.5 * (max(v[km.mod$cluster == oc[2]]) + min(v[km.mod$cluster == oc[3]]))
+ 
+# using upper threshold
+imgHi = v
+imgHi[imgHi <= hiThresh] = 0 
+imgHi[imgHi > hiThresh] = 1
+ 
+return (imgHi)
+}
+ 
+dirtyFolder = "~/Pictures/train"
+cleanFolder = "~/Pictures/train_cleaned"
+outFolder = "~/docs/archive/2020/dirtyocr/kaggledata"
+ 
+outPath = file.path(outFolder, "trainingdata.csv")
+filenames = list.files(dirtyFolder)
+for (f in filenames)
+{
+print(f)
+imgX = readPNG(file.path(dirtyFolder, f))
+imgY = readPNG(file.path(cleanFolder, f))
+ 
+# turn the images into vectors
+x = matrix(imgX, nrow(imgX) * ncol(imgX), 1)
+y = matrix(imgY, nrow(imgY) * ncol(imgY), 1)
+ 
+# threshold the image
+x2 = kmeansThreshold(imgX)
+ 
+dat = data.table(cbind(y, x, x2))
+setnames(dat,c("y", "raw", "thresholded"))
+write.table(dat, file=outPath, append=(f != filenames[1]), sep=",", row.names=FALSE, col.names=(f == filenames[1]), quote=FALSE)
+}
+ 
+# view the data
+dat = read.csv(outPath)
+rows = sample(nrow(dat), 10000)
+d1 = dat[rows,]
+plot(d1$raw[dat$thresholded == 0], d1$y[dat$thresholded == 0], col = "blue")
+lines(d1$raw[dat$thresholded == 1], d1$y[dat$thresholded == 1], col = "red", type="p")
+ 
+# fit a model to a subset of the data
+rows = sample(nrow(dat), 100000)
+gbm.mod = gbm(y ~ raw + thresholded, data = dat[rows,], n.trees = 5000, cv.folds = 10, train.fraction = 0.5)
+best.iter <- gbm.perf(gbm.mod,method="cv")
+ 
+# what score do we get on the training data?
+yHat = predict(gbm.mod, newdata=dat, n.trees = best.iter)
+rmse = sqrt(mean( (yHat - dat$y) ^ 2 ))
+print(rmse)
+ 
+# show the predicted result for a sample image
+img = readPNG("testimages/processed/secolo2_bw.png")
+x = data.table(matrix(img, nrow(img) * ncol(img), 1), kmeansThreshold(img))
+setnames(x, c("raw", "thresholded"))
+yHat = predict(gbm.mod, newdata=x, n.trees = best.iter)
+imgOut = matrix(yHat, nrow(img), ncol(img))
+writePNG(imgOut, "testimages/processed/secolo2_bw+threshold.png")
+plot(raster(imgOut))
+```
+
+
+
+part 3
+using adaptive thresholding
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(version = "3.10")
+
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster, OpenImageR, EBImage)
+ 
+# sample image containing coffee cup stain
+img = readPNG("testimages/processed/secolo2_bw.png")
+ 
+# using adaptive thresholding
+img.eb = readImage("testimages/processed/secolo2_bw.png")
+img.thresholded.3 = thresh(img.eb, 3, 3)
+display(img.thresholded.3)
+img.thresholded.5 = thresh(img.eb, 5, 5)
+display(img.thresholded.5)
+img.thresholded.7 = thresh(img.eb, 7, 7)
+display(img.thresholded.7)
+img.thresholded.9 = thresh(img.eb, 9, 9)
+display(img.thresholded.9)
+```
+
+k-menas thresholding
+```{r}
+# a function to do k-means thresholding
+kmeansThreshold = function(img)
+{
+# fit 3 clusters
+v = img2vec(img)
+km.mod = kmeans(v, 3)
+# allow for the random ordering of the clusters
+oc = order(km.mod$centers)
+# the higher threshold is the halfway point between the top of the middle cluster and the bottom of the highest cluster
+hiThresh = 0.5 * (max(v[km.mod$cluster == oc[2]]) + min(v[km.mod$cluster == oc[3]]))
+ 
+# using upper threshold
+imgHi = v
+imgHi[imgHi <= hiThresh] = 0
+imgHi[imgHi > hiThresh] = 1
+ 
+return (imgHi)
+}
+ 
+# a function to turn a matrix image into a vector
+img2vec = function(img)
+{
+return (matrix(img, nrow(img) * ncol(img), 1))
+}
+img.thresholded.3 = thresh(img.eb, 3, 3)
+img.thresholded.5 = thresh(img.eb, 5, 5)
+img.thresholded.7 = thresh(img.eb, 7, 7)
+img.thresholded.9 = thresh(img.eb, 9, 9)
+img.thresholded.11 = thresh(img.eb, 11, 11)
+ 
+# a function to convert an Image into a matrix
+Image2Mat = function(Img)
+{
+m1 = t(matrix(Img, nrow(Img), ncol(Img)))
+return(m1)
+}
+ 
+# combine the adaptive thresholding
+ttt.1 = cbind(img2vec(Image2Mat(img.thresholded.3)), img2vec(Image2Mat(img.thresholded.5)), img2vec(Image2Mat(img.thresholded.7)),
+img2vec(Image2Mat(img.thresholded.9)), img2vec(Image2Mat(img.thresholded.11)), img2vec(kmeansThreshold(img)))
+ttt.2 = apply(ttt.1, 1, max)
+ttt.3 = matrix(ttt.2, nrow(img), ncol(img))
+plot(raster(ttt.3))
+```
+
+
+summary 3
+```{r}
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster, data.table, gbm, foreach, doSNOW, EBImage)
+ 
+
+# a function to do k-means thresholding
+kmeansThreshold = function(img)
+{
+# fit 3 clusters
+v = img2vec(img)
+km.mod = kmeans(v, 3)
+# allow for the random ordering of the clusters
+oc = order(km.mod$centers)
+# the higher threshold is the halfway point between the top of the middle cluster and the bottom of the highest cluster
+hiThresh = 0.5 * (max(v[km.mod$cluster == oc[2]]) + min(v[km.mod$cluster == oc[3]]))
+ 
+# using upper threshold
+imgHi = v
+imgHi[imgHi <= hiThresh] = 0
+imgHi[imgHi > hiThresh] = 1
+ 
+return (imgHi)
+}
+ 
+# a function that applies adaptive thresholding
+adaptiveThresholding = function(img)
+{
+img.eb <- Image(t(img))
+img.thresholded.3 = thresh(img.eb, 3, 3)
+img.thresholded.5 = thresh(img.eb, 5, 5)
+img.thresholded.7 = thresh(img.eb, 7, 7)
+img.thresholded.9 = thresh(img.eb, 9, 9)
+img.thresholded.11 = thresh(img.eb, 11, 11)
+img.kmThresh = kmeansThreshold(img)
+ 
+# combine the adaptive thresholding
+ttt.1 = cbind(img2vec(Image2Mat(img.thresholded.3)), img2vec(Image2Mat(img.thresholded.5)), img2vec(Image2Mat(img.thresholded.7)), img2vec(Image2Mat(img.thresholded.9)), img2vec(Image2Mat(img.thresholded.11)), img2vec(kmeansThreshold(img)))
+ttt.2 = apply(ttt.1, 1, max)
+ttt.3 = matrix(ttt.2, nrow(img), ncol(img))
+return (ttt.3)
+}
+ 
+# a function to turn a matrix image into a vector
+img2vec = function(img)
+{
+return (matrix(img, nrow(img) * ncol(img), 1))
+}
+ 
+# a function to convert an Image into a matrix
+Image2Mat = function(Img)
+{
+m1 = t(matrix(Img, nrow(Img), ncol(Img)))
+return(m1)
+}
+ 
+dirtyFolder = "~/Pictures/train"
+cleanFolder = "~/Pictures/train_cleaned"
+outFolder = "~/docs/archive/2020/dirtyocr/kaggledata/"
+ 
+outPath = file.path(outFolder, "trainingdata.csv")
+filenames = list.files(dirtyFolder)
+for (f in filenames)
+{
+print(f)
+imgX = readPNG(file.path(dirtyFolder, f))
+imgY = readPNG(file.path(cleanFolder, f))
+ 
+# turn the images into vectors
+x = matrix(imgX, nrow(imgX) * ncol(imgX), 1)
+y = matrix(imgY, nrow(imgY) * ncol(imgY), 1)
+ 
+# threshold the image
+x2 = kmeansThreshold(imgX)
+ 
+# adaptive thresholding
+x3 = img2vec(adaptiveThresholding(imgX))
+ 
+dat = data.table(cbind(y, x, x2, x3))
+setnames(dat,c("y", "raw", "thresholded", "adaptive"))
+write.table(dat, file=outPath, append=(f != filenames[1]), sep=",", row.names=FALSE, col.names=(f == filenames[1]), quote=FALSE)
+}
+ 
+# read in the full data table
+dat = read.csv(outPath)
+ 
+# fit a model to a subset of the data
+set.seed(1)
+rows = sample(nrow(dat), 1000000)
+gbm.mod = gbm(y ~ raw + thresholded + adaptive, data = dat[rows,], n.trees = 7500, cv.folds = 3, train.fraction = 0.5, interaction.depth = 5)
+best.iter <- gbm.perf(gbm.mod,method="cv",oobag.curve = FALSE)
+ 
+s = summary(gbm.mod)
+ 
+# get the predictions - using parallel processing to save time
+numCores = 6 #change the 6 to your number of CPU cores. or maybe lower due to RAM limits
+cl = makeCluster(numCores)
+registerDoSNOW(cl)
+num_splits = numCores
+split_testing = sort(rank(1:nrow(dat))%%numCores)
+yHat = foreach(i=unique(split_testing),.combine=c,.packages=c("gbm")) %dopar% {
+as.numeric(predict(gbm.mod, newdata=dat[split_testing==i,], n.trees = best.iter))
+}
+stopCluster(cl)
+ 
+# what score do we get on the training data?
+rmse = sqrt(mean( (yHat - dat$y) ^ 2 ))
+print(rmse)
+ 
+# show the predicted result for a sample image
+img = readPNG("testimages/processed/secolo2_bw.png")
+x = data.table(matrix(img, nrow(img) * ncol(img), 1), kmeansThreshold(img), img2vec(adaptiveThresholding(img)))
+setnames(x, c("raw", "thresholded", "adaptive"))
+yHat = predict(gbm.mod, newdata=x, n.trees = best.iter)
+imgOut = matrix(yHat, nrow(img), ncol(img))
+writePNG(imgOut, "testimages/processed/secolo2_bw+adaptthresh.png")
+plot(raster(imgOut))
+```
+
+Part 5: background removal
+```{r}
+median_Filter = function(img, filterWidth)
+{
+ pad = floor(filterWidth / 2)
+ padded = matrix(NA, nrow(img) + 2 * pad, ncol(img) + 2 * pad)
+ padded[pad + seq_len(nrow(img)), pad + seq_len(ncol(img))] = img
+  
+ tab = NULL
+ for (i in seq_len(filterWidth))
+ {
+ for (j in seq_len(filterWidth))
+ {
+ if (i == 1 && j == 1)
+ {
+ tab = img2vec(padded[i - 1 + seq_len(nrow(img)), j - 1 + seq_len(ncol(img))])
+ } else {
+ tab = cbind(tab, img2vec(padded[i - 1 + seq_len(nrow(img)), j - 1 + seq_len(ncol(img))]))
+ }
+ }
+ }
+  
+ filtered = unlist(apply(tab, 1, function(x) median(x[!is.na(x)])))
+ return (matrix(filtered, nrow(img), ncol(img)))
+}
+ 
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster)
+ 
+# read in the coffee cup stain image
+img = readPNG("testimages/processed/secolo2_bw.png")
+ 
+# use the median filter and save the result
+filtered = median_Filter(img, 17)
+writePNG(filtered, "testimages/processed/secolo2_bw+median.png")
+```
+
+
+
+Part 6
+```{r}
+# show the predicted result for a sample image
+img = readPNG("testimages/processed/secolo2_bw.png")
+ 
+# create a padded image within which we will embed our source image
+pad = 2
+width = 2 * pad + 1
+padded = matrix(1, nrow(img) + 2 * pad, ncol(img) + 2 * pad)
+padded[pad + seq_len(nrow(img)), pad + seq_len(ncol(img))] = img
+ 
+tab = matrix(1, nrow(img) * ncol(img), width ^ 2)
+k = 1
+for (i in seq_len(width))
+{
+for (j in seq_len(width))
+{
+tab[,k] = img2vec(padded[i - 1 + seq_len(nrow(img)), j - 1 + seq_len(ncol(img))])
+k = k + 1
+}
+}
+ 
+head(tab[,1:4])
+```
+
+
+
+the bigger part -- xgboost
+```{r}
+# libraries
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(png, raster, data.table, gbm, foreach, doSNOW, biOps, xgboost, Ckmeans.1d.dp)
+ 
+if (!require("EBImage"))
+{
+source("http://bioconductor.org/biocLite.R")
+biocLite("EBImage")
+}
+ 
+# a function to do k-means thresholding
+kmeansThreshold = function(img)
+{
+# fit 3 clusters
+v = img2vec(img)
+km.mod = kmeans(v, 3)
+# allow for the random ordering of the clusters
+oc = order(km.mod$centers)
+# the higher threshold is the halfway point between the top of the middle cluster and the bottom of the highest cluster
+hiThresh = 0.5 * (max(v[km.mod$cluster == oc[2]]) + min(v[km.mod$cluster == oc[3]]))
+ 
+# using upper threshold
+imgHi = v
+imgHi[imgHi <= hiThresh] = 0 
+imgHi[imgHi > hiThresh] = 1
+ 
+return (imgHi)
+}
+ 
+# a function that applies adaptive thresholding
+adaptiveThresholding = function(img)
+{
+img.eb  0] = 0
+m1 = min(foreground)
+m2 = max(foreground)
+foreground = (foreground - m1) / (m2 - m1)
+ 
+return (matrix(foreground, nrow(img), ncol(img)))
+}
+ 
+# a function that groups together the pixels contained within a sliding window around each pixel of interest
+proximalPixels = function(img)
+{
+pad = 2
+width = 2 * pad + 1
+padded = matrix(median(img), nrow(img) + 2 * pad, ncol(img) + 2 * pad)
+padded[pad + seq_len(nrow(img)), pad + seq_len(ncol(img))] = img
+ 
+tab = matrix(1, nrow(img) * ncol(img), width ^ 2)
+k = 1
+for (i in seq_len(width))
+{
+for (j in seq_len(width))
+{
+tab[,k] = img2vec(padded[i - 1 + seq_len(nrow(img)), j - 1 + seq_len(ncol(img))])
+k = k + 1
+}
+}
+ 
+return (tab)
+}
+ 
+dirtyFolder = "~/Pictures/train"
+cleanFolder = "~/Pictures/train_cleaned"
+outFolder = "~/docs/archive/2020/dirtyocr/kaggledata"
+ 
+outPath = file.path(outFolder, "trainingdata6.csv")
+filenames = list.files(dirtyFolder)
+for (f in filenames)
+{
+print(f)
+imgX = readPNG(file.path(dirtyFolder, f))
+imgY = readPNG(file.path(cleanFolder, f))
+ 
+# turn the images into vectors
+x = matrix(imgX, nrow(imgX) * ncol(imgX), 1)
+y = matrix(imgY, nrow(imgY) * ncol(imgY), 1)
+ 
+# threshold the image
+x2 = kmeansThreshold(imgX)
+ 
+# adaptive thresholding
+x3 = img2vec(adaptiveThresholding(imgX))
+ 
+# canny edge detector and related features
+x4 = img2vec(cannyEdges(imgX))
+x5 = img2vec(cannyDilated1(imgX))
+x6 = img2vec(cannyDilated2(imgX))
+ 
+# median filter and related features
+x7 = img2vec(median_Filter(imgX, 17))
+x8 = img2vec(background_Removal(imgX))
+ 
+# surrounding pixels
+x9 = proximalPixels(imgX)
+ 
+dat = data.table(cbind(y, x, x2, x3, x4, x5, x6, x7, x8, x9))
+setnames(dat,append(c("y", "raw", "thresholded", "adaptive", "canny", "cannyDilated1", "cannyDilated2", "median17", "backgroundRemoval"), paste("x", 1:25, sep="")))
+write.table(dat, file=outPath, append=(f != filenames[1]), sep=",", row.names=FALSE, col.names=(f == filenames[1]), quote=FALSE)
+}
+ 
+# read in the full data table
+dat = read.csv(outPath)
+ 
+# fit an xgboost model to a subset of the data
+set.seed(1)
+rows = sample(nrow(dat), 2000000)
+dat[is.na(dat)] = 0
+dtrain  1] = 1
+imgOut = matrix(yHatImg, nrow(img), ncol(img))
+writePNG(imgOut, "testimages/processed/secolo2_bw+6.png")
+plot(raster(imgOut))
+```
+
+
